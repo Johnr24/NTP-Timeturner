@@ -45,6 +45,7 @@ pub struct LtcState {
     pub clock_delta_history: VecDeque<i64>,
     pub last_match_status: String,
     pub last_match_check: i64,
+    pub manual_sync_request: bool,
 }
 
 impl LtcState {
@@ -57,6 +58,7 @@ impl LtcState {
             clock_delta_history: VecDeque::with_capacity(20),
             last_match_status: "UNKNOWN".into(),
             last_match_check: 0,
+            manual_sync_request: false,
         }
     }
 

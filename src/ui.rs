@@ -36,11 +36,10 @@ fn ntp_service_toggle(start: bool) {
     let _ = Command::new("systemctl").args(&[action, "ntpd"]).status();
 }
 
-/// Launch the full-featured TUI; reads `offset` live and performs auto-sync if out of sync.
+/// Launch the full-featured TUI; this is a read-only view of the sync status.
 pub fn start_ui(
     state: Arc<Mutex<LtcState>>,
     serial_port: String,
-    offset: Arc<Mutex<i64>>,
 ) {
     let mut stdout = stdout();
     // Enter alternate screen and hide cursor
@@ -49,8 +48,6 @@ pub fn start_ui(
 
     // Recent log of messages (last 10)
     let mut logs: VecDeque<String> = VecDeque::with_capacity(10);
-    // Tracks when we first detected out-of-sync
-    let mut out_of_sync_since: Option<Instant> = None;
 
     // For caching the timecode delta display once per second
     let mut last_delta_update = Instant::now() - Duration::from_secs(1);
@@ -58,10 +55,7 @@ pub fn start_ui(
     let mut cached_delta_frames: i64 = 0;
 
     loop {
-        // 1️⃣ Read hardware offset from watcher
-        let hw_offset_ms = *offset.lock().unwrap();
-
-        // 2️⃣ Check NTP service status and gather network interfaces
+        // 1️⃣ Check NTP service status and gather network interfaces
         let ntp_active = ntp_service_active();
         let interfaces: Vec<String> = get_if_addrs()
             .unwrap_or_default()
@@ -70,40 +64,7 @@ pub fn start_ui(
             .map(|ifa| ifa.ip().to_string())
             .collect();
 
-        // 3️⃣ Measure & record jitter and Timecode Δ when LOCKED; clear on FREE
-        {
-            let mut st = state.lock().unwrap();
-            if let Some(frame) = st.latest.clone() {
-                if frame.status == "LOCK" {
-                    // Jitter in ms
-                    let now = Utc::now();
-                    let raw = (now - frame.timestamp).num_milliseconds();
-                    let measured = raw - hw_offset_ms;
-                    st.record_offset(measured);
-
-                    // Timecode delta: how far system clock differs from LTC
-                    let local = Local::now();
-                    let sub_ms = ((frame.frames as f64 / frame.frame_rate) * 1000.0).round() as i64;
-                    let base_time = NaiveTime::from_hms_opt(
-                        frame.hours,
-                        frame.minutes,
-                        frame.seconds,
-                    ).unwrap_or(local.time());
-                    let offset_dt = local.date_naive().and_time(base_time)
-                        + ChronoDuration::milliseconds(sub_ms);
-                    let ltc_dt = Local.from_local_datetime(&offset_dt)
-                        .single()
-                        .unwrap_or(local);
-                    let delta_ms = local.signed_duration_since(ltc_dt).num_milliseconds();
-                    st.record_clock_delta(delta_ms);
-                } else {
-                    st.clear_offsets();
-                    st.clear_clock_deltas();
-                }
-            }
-        }
-
-        // 4️⃣ Compute averages & statuses
+        // 2️⃣ Compute averages & statuses
         let (avg_ms, avg_frames, status_str, lock_ratio, avg_delta) = {
             let st = state.lock().unwrap();
             (
@@ -115,7 +76,7 @@ pub fn start_ui(
             )
         };
 
-        // 5️⃣ Update cached delta once per second
+        // 3️⃣ Update cached delta once per second
         if last_delta_update.elapsed() >= Duration::from_secs(1) {
             cached_delta_ms = avg_delta;
             // Recompute frames equivalent
@@ -128,58 +89,7 @@ pub fn start_ui(
             last_delta_update = Instant::now();
         }
 
-        // 6️⃣ Auto-sync if "OUT OF SYNC" or Δ >10ms for 5s
-        if status_str == "OUT OF SYNC" || cached_delta_ms.abs() > 10 {
-            if let Some(start) = out_of_sync_since {
-                if start.elapsed() >= Duration::from_secs(5) {
-                    // Perform sync to LTC
-                    if let Ok(stl) = state.lock() {
-                        if let Some(frame) = &stl.latest {
-                            let local_now = Local::now();
-                            let sub_ms = ((frame.frames as f64 / frame.frame_rate) * 1000.0)
-                                .round() as i64;
-                            let base_time = NaiveTime::from_hms_opt(
-                                frame.hours,
-                                frame.minutes,
-                                frame.seconds,
-                            ).unwrap_or(local_now.time());
-                            let offset_dt = local_now.date_naive().and_time(base_time)
-                                + ChronoDuration::milliseconds(sub_ms);
-                            let ltc_dt = Local.from_local_datetime(&offset_dt)
-                                .single()
-                                .unwrap_or(local_now);
-                            let ts = format!("{:02}:{:02}:{:02}.{:03}",
-                                ltc_dt.hour(),
-                                ltc_dt.minute(),
-                                ltc_dt.second(),
-                                ltc_dt.timestamp_subsec_millis()
-                            );
-                            let res = Command::new("sudo")
-                                .arg("date")
-                                .arg("-s")
-                                .arg(&ts)
-                                .status();
-                            let msg = if res.as_ref().map_or(false, |s| s.success()) {
-                                format!("🔄 Auto-synced to LTC: {}", ts)
-                            } else {
-                                "❌ Auto-sync failed".into()
-                            };
-                            if logs.len() == 10 {
-                                logs.pop_front();
-                            }
-                            logs.push_back(msg);
-                        }
-                    }
-                    out_of_sync_since = None;
-                }
-            } else {
-                out_of_sync_since = Some(Instant::now());
-            }
-        } else {
-            out_of_sync_since = None;
-        }
-
-        // 7️⃣ Draw static UI header
+        // 4️⃣ Draw static UI header
         queue!(
             stdout,
             MoveTo(0, 0), Clear(ClearType::All),
@@ -190,7 +100,7 @@ pub fn start_ui(
         )
         .unwrap();
 
-        // 8️⃣ Draw LTC and System Clock
+        // 5️⃣ Draw LTC and System Clock
         if let Ok(st) = state.lock() {
             if let Some(frame) = &st.latest {
                 queue!(
@@ -219,7 +129,7 @@ pub fn start_ui(
             queue!(stdout, MoveTo(2, 9), Print(format!("System Clock     : {}", sys_ts))).unwrap();
         }
 
-        // 9️⃣ Overlay metrics in new order
+        // 6️⃣ Overlay metrics in new order
         // Timecode Δ line
         let dcol = if cached_delta_ms.abs() < 20 {
             Color::Green
@@ -279,7 +189,7 @@ pub fn start_ui(
         )
         .unwrap();
 
-        // 10️⃣ Footer and logs
+        // 7️⃣ Footer and logs
         queue!(stdout,
             MoveTo(2, 16), Print("[S] Set system clock to LTC    [Q] Quit"),
         )
@@ -290,7 +200,7 @@ pub fn start_ui(
 
         stdout.flush().unwrap();
 
-        // 11️⃣ Handle manual sync and quit keys
+        // 8️⃣ Handle manual sync and quit keys
         if poll(Duration::from_millis(50)).unwrap() {
             if let Event::Key(evt) = read().unwrap() {
                 match evt.code {
@@ -300,45 +210,13 @@ pub fn start_ui(
                         process::exit(0);
                     }
                     KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
-                        if let Ok(stlock) = state.lock() {
-                            if let Some(frame) = &stlock.latest {
-                                let local_now = Local::now();
-                                let sub_ms = ((frame.frames as f64 / frame.frame_rate) * 1000.0)
-                                    .round() as i64;
-                                let base_time = NaiveTime::from_hms_opt(
-                                    frame.hours,
-                                    frame.minutes,
-                                    frame.seconds,
-                                )
-                                .unwrap_or(local_now.time());
-                                let offset_dt = local_now.date_naive().and_time(base_time)
-                                    + ChronoDuration::milliseconds(sub_ms);
-                                let ltc_dt = Local.from_local_datetime(&offset_dt)
-                                    .single()
-                                    .unwrap_or(local_now);
-                                let ts = format!(
-                                    "{:02}:{:02}:{:02}.{:03}",
-                                    ltc_dt.hour(),
-                                    ltc_dt.minute(),
-                                    ltc_dt.second(),
-                                    ltc_dt.timestamp_subsec_millis(),
-                                );
-                                let res = Command::new("sudo")
-                                    .arg("date")
-                                    .arg("-s")
-                                    .arg(&ts)
-                                    .status();
-                                let msg = if res.as_ref().map_or(false, |s| s.success()) {
-                                    format!("✔ Synced exactly to LTC: {}", ts)
-                                } else {
-                                    "❌ date cmd failed".into()
-                                };
-                                if logs.len() == 10 {
-                                    logs.pop_front();
-                                }
-                                logs.push_back(msg);
-                            }
+                        if let Ok(mut stlock) = state.lock() {
+                            stlock.manual_sync_request = true;
                         }
+                        if logs.len() == 10 {
+                            logs.pop_front();
+                        }
+                        logs.push_back("Manual sync requested...".into());
                     }
                     _ => {}
                 }

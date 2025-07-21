@@ -1,19 +1,22 @@
 ﻿// src/main.rs
 
 mod config;
-mod sync_logic;
 mod serial_input;
+mod sync_logic;
+mod sync_manager;
 mod ui;
 
 use crate::config::watch_config;
-use crate::sync_logic::LtcState;
 use crate::serial_input::start_serial_thread;
+use crate::sync_logic::LtcState;
+use crate::sync_manager::start_sync_manager;
 use crate::ui::start_ui;
 
 use std::{
+    env,
     fs,
     path::Path,
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 
@@ -31,27 +34,38 @@ fn ensure_config() {
 }
 
 fn main() {
+    // Check for --daemon flag
+    let is_daemon = env::args().any(|a| a == "--daemon");
+
     // 🔄 Ensure there's always a config.json present
     ensure_config();
 
     // 1️⃣ Start watching config.json for changes
     let hw_offset = watch_config("config.json");
-    println!("🔧 Watching config.json (hardware_offset_ms)...");
+    if !is_daemon {
+        println!("🔧 Watching config.json (hardware_offset_ms)...");
+    }
 
     // 2️⃣ Channel for raw LTC frames
     let (tx, rx) = mpsc::channel();
-    println!("✅ Channel created");
+    if !is_daemon {
+        println!("✅ Channel created");
+    }
 
     // 3️⃣ Shared state for UI and serial reader
     let ltc_state = Arc::new(Mutex::new(LtcState::new()));
-    println!("✅ State initialised");
+    if !is_daemon {
+        println!("✅ State initialised");
+    }
 
     // 4️⃣ Spawn the serial reader thread (no offset here)
     {
-        let tx_clone    = tx.clone();
+        let tx_clone = tx.clone();
         let state_clone = ltc_state.clone();
         thread::spawn(move || {
-            println!("🚀 Serial thread launched");
+            if !is_daemon {
+                println!("🚀 Serial thread launched");
+            }
             start_serial_thread(
                 "/dev/ttyACM0",
                 115200,
@@ -62,20 +76,34 @@ fn main() {
         });
     }
 
-    // 5️⃣ Spawn the UI renderer thread, passing the live offset Arc
+    // 5️⃣ Spawn the sync manager thread
     {
-        let ui_state     = ltc_state.clone();
+        let state_clone = ltc_state.clone();
         let offset_clone = hw_offset.clone();
-        let port         = "/dev/ttyACM0".to_string();
         thread::spawn(move || {
-            println!("🖥️ UI thread launched");
-            start_ui(ui_state, port, offset_clone);
+            if !is_daemon {
+                println!("⚙️ Sync manager thread launched");
+            }
+            start_sync_manager(state_clone, offset_clone);
         });
     }
 
-    // 6️⃣ Keep main thread alive
-    println!("📡 Main thread entering loop...");
-    for _frame in rx {
-        // no-op
+    // 6️⃣ Spawn UI thread if not in daemon mode, otherwise loop forever
+    if !is_daemon {
+        let ui_state = ltc_state.clone();
+        let port = "/dev/ttyACM0".to_string();
+        let ui_handle = thread::spawn(move || {
+            println!("🖥️ UI thread launched");
+            start_ui(ui_state, port);
+        });
+
+        // Wait for UI to exit
+        ui_handle.join().unwrap();
+    } else {
+        println!("🚀 Timeturner running in daemon mode.");
+        // In daemon mode, just keep the main thread alive by consuming from the channel.
+        for _frame in rx {
+            // no-op
+        }
     }
 }
